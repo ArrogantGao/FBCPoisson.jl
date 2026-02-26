@@ -1,6 +1,8 @@
 using FBCPoisson
 using Test
+using FFTW
 
 @testset "FBCPoisson.jl" begin
-    # Write your tests here.
+    include("laplace.jl")
+    include("lfbc3d.jl")
 end
