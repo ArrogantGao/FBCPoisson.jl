@@ -2,48 +2,12 @@ using FBCPoisson
 using Test
 using LinearAlgebra
 using Random
-using NonuniformFFTs
+using FINUFFT
 using SpecialFunctions: erf
 
 @inline function gaussian_laplace3d_pot(center::NTuple{3, Float64}, target::NTuple{3, Float64}, sigma::Float64)
     r = norm(target .- center)
     return erf(r / (sqrt(2.0) * sigma)) / r / (4π)
-end
-
-@testset "NUFFT (m, sigma) selection vs high-accuracy reference" begin
-    Random.seed!(2026)
-    Ns = (32, 32, 32)
-    M = 200
-    points = (rand(M) .* 2π, rand(M) .* 2π, rand(M) .* 2π)
-    nonuniform_data = randn(ComplexF64, M)
-    uniform_data = randn(ComplexF64, Ns...)
-
-    pref = PlanNUFFT(ComplexF64, Ns; m = HalfSupport(15), σ = 2.0)
-    set_points!(pref, points)
-    type1_ref = Array{ComplexF64}(undef, size(pref))
-    type2_ref = Vector{ComplexF64}(undef, M)
-    exec_type1!(type1_ref, pref, nonuniform_data)
-    exec_type2!(type2_ref, pref, uniform_data)
-
-    prev_m = 0
-    for tol in (1e-3, 1e-6, 1e-9)
-        sigma_sel, m_sel = FBCPoisson._select_nufft_sigma_m(tol; dim = 3)
-        @test m_sel >= prev_m
-        prev_m = m_sel
-
-        psel = PlanNUFFT(ComplexF64, Ns; m = HalfSupport(m_sel), σ = sigma_sel)
-        set_points!(psel, points)
-
-        type1_sel = Array{ComplexF64}(undef, size(psel))
-        type2_sel = Vector{ComplexF64}(undef, M)
-        exec_type1!(type1_sel, psel, nonuniform_data)
-        exec_type2!(type2_sel, psel, uniform_data)
-
-        relerr1 = norm(type1_sel .- type1_ref) / norm(type1_ref)
-        relerr2 = norm(type2_sel .- type2_ref) / norm(type2_ref)
-        @test relerr1 <= tol
-        @test relerr2 <= tol
-    end
 end
 
 @inline function gaussian_laplace3d_grad(center::NTuple{3, Float64}, target::NTuple{3, Float64}, sigma::Float64)
@@ -54,61 +18,145 @@ end
     return (ddr / (4π * r)) .* collect(r_vec)
 end
 
-@testset "lfbc3d vs Gaussian analytic solution" begin
-    # Match BoundaryIntegral.jl gaussian_laplace3d_{pot,grad}: a normalized Gaussian density.
-    center = (0.03, -0.02, 0.01)
-    sigma = 0.08
+function gauss_legendre_nodes_weights(n::Int, a::Float64, b::Float64)
+    @assert n >= 2
+    β = [k / sqrt(4k^2 - 1) for k in 1:(n - 1)]
+    T = SymTridiagonal(zeros(n), β)
+    F = eigen(T)
+    x = collect(F.values)
+    w = collect(2 .* (F.vectors[1, :]).^2)
+    x = ((b - a) / 2) .* x .+ (a + b) / 2
+    w = ((b - a) / 2) .* w
+    return x, w
+end
 
-    n = 48
-    xs = collect(range(-0.5, 0.5; length = n))
-    h = xs[2] - xs[1]
-    w = h^3
+function make_source_quadrature(kind::Symbol, n::Int, region::Float64, center::NTuple{3, Float64}, sigma::Float64)
+    if kind == :uniform
+        xs = collect(range(-region, region; length = n))
+        h = xs[2] - xs[1]
+        wx = fill(h, n)
+        ys, wy = xs, wx
+        zs, wz = xs, wx
+    elseif kind == :gl
+        xs, wx = gauss_legendre_nodes_weights(n, -region, region)
+        ys, wy = gauss_legendre_nodes_weights(n, -region, region)
+        zs, wz = gauss_legendre_nodes_weights(n, -region, region)
+    else
+        error("unknown quadrature kind: $kind")
+    end
+
     ns = n^3
     sources = Matrix{Float64}(undef, 3, ns)
     charges = Vector{Float64}(undef, ns)
     idx = 1
-    for x in xs, y in xs, z in xs
+    for ix in eachindex(xs), iy in eachindex(ys), iz in eachindex(zs)
+        x = xs[ix]
+        y = ys[iy]
+        z = zs[iz]
         sources[:, idx] .= (x, y, z)
         r2 = (x - center[1])^2 + (y - center[2])^2 + (z - center[3])^2
         rho = exp(-r2 / (2 * sigma^2)) / ((2π)^(3 / 2) * sigma^3)
-        charges[idx] = rho * w
+        charges[idx] = rho * wx[ix] * wy[iy] * wz[iz]
         idx += 1
     end
+    return sources, charges
+end
 
-    targets = [
-         0.33 -0.11  0.07 -0.26 0.01
-        -0.15  0.20 -0.29  0.31 0.01
-         0.10 -0.27  0.24 -0.08 0.01
-    ]
+function make_targets_10x10x10(a::Float64, b::Float64)
+    xs = collect(range(a, b; length = 10))
+    nt = 10^3
+    targets = Matrix{Float64}(undef, 3, nt)
+    idx = 1
+    for x in xs, y in xs, z in xs
+        targets[:, idx] .= (x, y, z)
+        idx += 1
+    end
+    return targets
+end
 
-    exact_pot = [
-        gaussian_laplace3d_pot(center, (targets[1, i], targets[2, i], targets[3, i]), sigma)
-        for i in axes(targets, 2)
-    ]
-    exact_grad = hcat([
-        gaussian_laplace3d_grad(center, (targets[1, i], targets[2, i], targets[3, i]), sigma)
-        for i in axes(targets, 2)
-    ]...)
+@inline gaussian_fhat_abs(k::Float64, bw::Float64) = exp(-0.5 * (bw * k)^2)
 
-    N = 64
-    pot = lfbc3d(N, sources, charges, targets, 1)
-    @test size(pot) == (size(targets, 2),)
-    @test maximum(abs.(pot .- exact_pot)) < 6e-3
+function select_N_from_gaussian_fhat(
+    bw::Float64,
+    tol::Float64;
+    Δk::Float64 = π / 2,
+    Nmin::Int = 64,
+    safety::Float64 = 2.0,
+)
+    @assert bw > 0
+    @assert tol > 0
+    @assert safety >= 1
+    kreq = sqrt(2 * log(1 / tol)) / bw
+    N = max(Nmin, ceil(Int, safety * kreq / Δk))
+    return iseven(N) ? N : N + 1
+end
 
-    pot2, grad2 = lfbc3d(N, sources, charges, targets, 2)
-    @test maximum(abs.(pot2 .- exact_pot)) < 6e-3
-    @test size(grad2) == size(exact_grad)
-    @test maximum(abs.(grad2 .- exact_grad)) < 3e-2
+@testset "NUFFT tol vs high-accuracy reference" begin
+    Random.seed!(2026)
+    Ns = (32, 32, 32)
+    M = 200
+    points = (rand(M) .* 2π, rand(M) .* 2π, rand(M) .* 2π)
+    nonuniform_data = randn(ComplexF64, M)
+    uniform_data = randn(ComplexF64, Ns...)
 
-    pre = lfbc3d_precompute(N, sources, charges)
-    phase = lfbc3d_prepare_evaluation(pre, targets)
-    pot3, grad3 = lfbc3d_evaluate(pre, phase, 2)
-    @test maximum(abs.(pot3 .- pot2)) < 1e-12
-    @test maximum(abs.(grad3 .- grad2)) < 1e-12
-    @test pre.m >= 2
-    @test pre.sigma in (1.25, 2.0)
+    eps_ref = 1e-15
+    type1_ref = nufft3d1(points[1], points[2], points[3], nonuniform_data, 1, eps_ref, Ns...)
+    type2_ref = nufft3d2(points[1], points[2], points[3], 1, eps_ref, uniform_data)
 
-    pre2 = lfbc3d_precompute(N, sources, charges; sigma = 2.0, m = 6)
-    @test pre2.sigma == 2.0
-    @test pre2.m == 6
+    for tol in (1e-3, 1e-6, 1e-9)
+        type1_sel = nufft3d1(points[1], points[2], points[3], nonuniform_data, 1, tol, Ns...)
+        type2_sel = nufft3d2(points[1], points[2], points[3], 1, tol, uniform_data)
+
+        relerr1 = norm(type1_sel .- type1_ref) / norm(type1_ref)
+        relerr2 = norm(type2_sel .- type2_ref) / norm(type2_ref)
+        @test relerr1 <= 5tol
+        @test relerr2 <= 5tol
+    end
+end
+
+@testset "lfbc3d pot/grad: bandwidth x tol x quadrature" begin
+    center = (0.1, - 0.2, 0.3)
+    bandwidths = (0.08, 0.18, 0.30, 2.0)
+    tols = (1e-3, 1e-6, 1e-9)
+    quadratures = (:uniform,)
+
+    targets = make_targets_10x10x10(-0.5, 0.5)
+    for bw in bandwidths
+        # Choose domain half-width R so exp(-R^2 / (2*bw^2)) = 1e-12.
+        region = bw * sqrt(2 * log(1e12))
+        nsrc = 20
+        sources, charges = make_source_quadrature(:uniform, nsrc, region, center, bw)
+
+        # Analytic Gaussian reference.
+        exact_pot = [
+            gaussian_laplace3d_pot(center, (targets[1, i], targets[2, i], targets[3, i]), bw)
+            for i in axes(targets, 2)
+        ]
+        exact_grad = hcat([
+            gaussian_laplace3d_grad(center, (targets[1, i], targets[2, i], targets[3, i]), bw)
+            for i in axes(targets, 2)
+        ]...)
+
+        prev_N = 0
+        for tol in tols
+
+            @info "Testing bw=$bw, tol=$tol."
+
+            N = select_N_from_gaussian_fhat(bw, tol)
+            @test gaussian_fhat_abs(N * (π / 2), bw) <= tol
+            @test N >= prev_N
+            prev_N = N
+
+            pre = lfbc3d_precompute(N, sources, targets, charges, tol)
+
+            phase = lfbc3d_prepare_evaluation(pre, targets)
+            pot, grad = lfbc3d_evaluate(pre, phase, 2)
+
+            relerr_pot = norm(pot .- exact_pot) / norm(exact_pot)
+            relerr_grad = norm(grad .- exact_grad) / norm(exact_grad)
+            @test relerr_pot <= tol
+            @test relerr_grad <= tol
+        end
+
+    end
 end

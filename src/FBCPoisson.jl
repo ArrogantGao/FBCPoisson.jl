@@ -1,6 +1,6 @@
 module FBCPoisson
 
-using NonuniformFFTs
+using FINUFFT
 using LinearAlgebra
 
 export truncated_laplace3d, truncated_laplace3d_hat
