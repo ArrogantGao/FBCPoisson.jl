@@ -44,7 +44,7 @@ function lfbc3d_precompute(
     nufft_tol::Real,
 )
     L = 1.8
-    margin = 1.0
+    margin = 0.99
 
     N > 0 || throw(ArgumentError("N must be positive"))
 

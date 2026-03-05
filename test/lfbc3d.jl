@@ -120,7 +120,7 @@ end
     tols = (1e-3, 1e-6, 1e-9)
     quadratures = (:uniform,)
 
-    targets = make_targets_10x10x10(-0.5, 0.5)
+    targets = make_targets_10x10x10(-0.6, 0.4)
     for bw in bandwidths
         # Choose domain half-width R so exp(-R^2 / (2*bw^2)) = 1e-12.
         region = bw * sqrt(2 * log(1e12))
