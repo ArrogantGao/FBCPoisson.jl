@@ -65,7 +65,8 @@ function lfbc3d_precompute(
 
     src_unit = (src .- reshape(collect(center), 3, 1)) ./ scale
 
-    Δk = T(2π / 3)
+    # Δk = T(2π / 3)
+    Δk = T(π / 2)
     src_points = (Δk .* vec(src_unit[1, :]), Δk .* vec(src_unit[2, :]), Δk .* vec(src_unit[3, :]))
     Nint = Int(N)
     Fk = nufft3d1(src_points[1], src_points[2], src_points[3], complex.(q), -1, T(nufft_tol), Nint, Nint, Nint)
